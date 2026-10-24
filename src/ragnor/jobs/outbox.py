@@ -24,6 +24,7 @@ its own transaction and commits.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -61,6 +62,8 @@ class JobPayload:
     locked_by: str | None = None
     created_at: datetime | None = None
     completed_at: datetime | None = None
+    claim_generation: int = 0
+    claim_owner: str | None = None
 
 
 def claim_jobs(jobs: list[JobPayload], worker_id: str, now: datetime) -> list[JobPayload]:
@@ -91,7 +94,7 @@ class EmbeddingJobStore(Protocol):
         a due retry and attempts remaining), ordered by creation time,
         using ``FOR UPDATE SKIP LOCKED`` so concurrent workers never
         claim the same row."""
-        ...
+        raise NotImplementedError
 
     async def mark_processing(self, jobs: list[JobPayload], worker_id: str) -> list[JobPayload]:
         """Transition jobs to ``processing`` and stamp the lock.
@@ -100,19 +103,19 @@ class EmbeddingJobStore(Protocol):
         worker claimed in the meantime is dropped so it is never
         processed twice.
         """
-        ...
+        raise NotImplementedError
 
     async def mark_completed(self, job: JobPayload) -> None:
         """Persist a successfully processed job as ``completed``."""
-        ...
+        raise NotImplementedError
 
     async def mark_failed(self, job: JobPayload, error: Exception) -> None:
         """Persist a failed job's retry/dead-letter transition."""
-        ...
+        raise NotImplementedError
 
     async def reclaim_stale(self, stale_after_seconds: float | None = None) -> int:
         """Reset jobs abandoned in ``processing`` back to ``pending``."""
-        ...
+        raise NotImplementedError
 
     async def enqueue(self, payload: dict[str, Any], session: Any = None) -> None:
         """Write a new pending job row.
@@ -122,7 +125,50 @@ class EmbeddingJobStore(Protocol):
         land in one transaction. Without a session the store opens its
         own transaction and commits.
         """
-        ...
+        raise NotImplementedError
+
+
+class LostJobOwnershipError(RuntimeError):
+    """Stale owner/lease/generation cannot alter an outbox job."""
+
+
+@runtime_checkable
+class AtomicClaimJobStore(Protocol):
+    """Optional stronger claim contract for durable multi-worker adapters."""
+
+    async def claim_and_mark_processing(self, limit: int, worker_id: str) -> list[JobPayload]:
+        """Claim and transition jobs in one durable transaction."""
+        raise NotImplementedError
+
+
+@runtime_checkable
+class LeaseRenewalJobStore(Protocol):
+    """Optional host-driven lease extension for long-running jobs."""
+
+    async def renew_lease(self, job: JobPayload, *, lease_seconds: float | None = None) -> None:
+        """Renew only the active owner and claim-generation lease."""
+        raise NotImplementedError
+
+
+async def _process_with_heartbeat(
+    store: LeaseRenewalJobStore,
+    processor: JobProcessor,
+    job: JobPayload,
+    interval: float,
+) -> None:
+    """Stop processing if renewal fails, without making a stale ack."""
+    work = asyncio.create_task(processor.process(job))
+    try:
+        while True:
+            completed, _ = await asyncio.wait({work}, timeout=interval)
+            if completed:
+                await work
+                return
+            await store.renew_lease(job)
+    finally:
+        if not work.done():
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
 
 
 @runtime_checkable
@@ -131,7 +177,7 @@ class JobProcessor(Protocol):
 
     async def process(self, job: JobPayload) -> None:
         """Process one claimed job. Raises on failure."""
-        ...
+        raise NotImplementedError
 
 
 async def process_pending_jobs(
@@ -139,6 +185,7 @@ async def process_pending_jobs(
     processor: JobProcessor,
     limit: int = 10,
     worker_id: str | None = None,
+    heartbeat_interval_seconds: float | None = None,
 ) -> int:
     """Process pending jobs.
 
@@ -157,28 +204,51 @@ async def process_pending_jobs(
         processor: The per-job processor.
         limit: Maximum number of jobs to process in one batch.
         worker_id: Identity stamped into ``locked_by``.
+        heartbeat_interval_seconds: Optional positive renewal cadence. When
+            supplied, the adapter MUST implement ``renew_lease`` and the
+            processor is cancelled if the claim is lost.
 
     Returns:
         int: Number of jobs successfully processed.
     """
-    jobs = await store.claim_pending(limit, worker_id or "")
-    jobs = await store.mark_processing(jobs, worker_id or "")
+    if heartbeat_interval_seconds is not None:
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
+        if not isinstance(store, LeaseRenewalJobStore):
+            raise ValueError("requested heartbeat requires a renew_lease job-store adapter")
+        lease = getattr(store, "lease_seconds", None)
+        if isinstance(lease, (int, float)) and heartbeat_interval_seconds >= lease:
+            raise ValueError("heartbeat_interval_seconds must be shorter than lease_seconds")
+
+    if isinstance(store, AtomicClaimJobStore):
+        jobs = await store.claim_and_mark_processing(limit, worker_id or "")
+    else:
+        # Backward compatibility with local/legacy single-host stores. Two
+        # separate calls do not promise distributed atomicity.
+        jobs = await store.claim_pending(limit, worker_id or "")
+        jobs = await store.mark_processing(jobs, worker_id or "")
 
     processed = 0
     for job in jobs:
         try:
-            await processor.process(job)
+            if heartbeat_interval_seconds is None:
+                await processor.process(job)
+            else:
+                await _process_with_heartbeat(store, processor, job, heartbeat_interval_seconds)
 
             job.status = "completed"
             job.completed_at = datetime.now(UTC)
             await store.mark_completed(job)
             processed += 1
             logger.info("Processed job '%s'.", job.job_id)
+        except LostJobOwnershipError:
+            # Do not turn an ownership conflict into a write by a stale worker.
+            raise
         except Exception as exc:
             job.retry_count += 1
             if job.retry_count >= job.max_attempts:
                 job.status = "dead_letter"
-                job.status_detail = f"Exhausted {job.max_attempts} attempts: {exc}"
+                job.status_detail = f"Exhausted {job.max_attempts} attempts ({type(exc).__name__})"
                 job.next_retry_at = None
                 job.locked_at = None
                 job.locked_by = None
@@ -186,7 +256,7 @@ async def process_pending_jobs(
                 backoff = RETRY_SCHEDULE[min(job.retry_count - 1, len(RETRY_SCHEDULE) - 1)]
                 job.next_retry_at = datetime.now(UTC) + backoff
                 job.status = "failed"
-                job.status_detail = str(exc)
+                job.status_detail = f"Retry scheduled ({type(exc).__name__})"
                 job.locked_at = None
                 job.locked_by = None
             await store.mark_failed(job, exc)
@@ -194,7 +264,7 @@ async def process_pending_jobs(
                 "Job '%s' failed (retry %d): %s",
                 job.job_id,
                 job.retry_count,
-                exc,
+                type(exc).__name__,
             )
 
     return processed
