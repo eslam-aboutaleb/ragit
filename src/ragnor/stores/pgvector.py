@@ -45,7 +45,7 @@ from ragnor.metrics import DistanceMetric, resolve_distance_metric
 from ragnor.stores._scoring import format_search_hit, project_metadata
 from ragnor.stores.base import EmbeddingFunction, VectorStore
 from ragnor.stores.registry import vector_store_registry
-from ragnor.types import RetrievalError
+from ragnor.exceptions import BackendUnavailableError, OperationTimeoutError
 from ragnor.validation import (
     validate_delete_selectors,
     validate_embedding,
@@ -464,16 +464,21 @@ class PgVectorStore(VectorStore):
                 )
 
             logger.debug(
-                "hybrid_search('%s') on %s: found %d results.",
-                query,
+                "hybrid_search on %s: found %d results.",
                 self.table_name,
                 len(retrieved),
             )
             return retrieved
         except Exception as exc:
-            logger.error("Hybrid search failed on %s: %s", self.table_name, exc)
+            logger.error("Hybrid search failed on %s: %s", self.table_name, type(exc).__name__)
             if strict:
-                raise RetrievalError(f"Hybrid search failed on {self.table_name}: {exc}") from exc
+                if isinstance(exc, TimeoutError):
+                    raise OperationTimeoutError(
+                        f"Hybrid search timed out on {self.table_name} ({type(exc).__name__})"
+                    ) from exc
+                raise BackendUnavailableError(
+                    f"Hybrid search failed on {self.table_name} ({type(exc).__name__})"
+                ) from exc
             return []
 
     async def vector_search(  # noqa: PLR0913, PLR0917
@@ -867,9 +872,15 @@ class PgVectorStore(VectorStore):
                     count = await self._sql.fetch_scalar(owned_session, stmt, params)
             return int(count) if count else 0
         except Exception as exc:
-            logger.error("Count failed on %s: %s", self.table_name, exc)
+            logger.error("Count failed on %s: %s", self.table_name, type(exc).__name__)
             if strict:
-                raise RetrievalError(f"Count failed on {self.table_name}: {exc}") from exc
+                if isinstance(exc, TimeoutError):
+                    raise OperationTimeoutError(
+                        f"Count timed out on {self.table_name} ({type(exc).__name__})"
+                    ) from exc
+                raise BackendUnavailableError(
+                    f"Count failed on {self.table_name} ({type(exc).__name__})"
+                ) from exc
             return 0
 
     @staticmethod
@@ -1023,5 +1034,5 @@ class PgVectorStore(VectorStore):
                 await self._sql.execute(session, stmt, params)
             logger.info("Upserted %d documents to %s.", len(documents), self.table_name)
         except Exception as exc:
-            logger.error("Upsert failed on %s: %s", self.table_name, exc)
+            logger.error("Upsert failed on %s: %s", self.table_name, type(exc).__name__)
             raise

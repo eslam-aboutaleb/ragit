@@ -12,6 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ragnor.exceptions import RagnorError, RetrievalError
+
+__all__ = ["Chunk", "Document", "RagnorError", "RetrievalError", "SearchResult"]
+
 
 @dataclass
 class Chunk:
@@ -49,7 +53,3 @@ class SearchResult:
     distance: float | None = None
     keyword_score: float | None = None
     rrf_score: float = 0.0
-
-
-class RetrievalError(Exception):
-    """Typed error for retrieval failures (used by strict-mode search)."""
