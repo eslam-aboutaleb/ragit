@@ -26,6 +26,7 @@ no driver, and no API key.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from ragnor.ingestion.pipeline import (
 )
 from ragnor.ingestion.sources import ListDocumentSource
 from ragnor.ingestion.versioning import IngestionSnapshot
+from ragnor.lifecycle import AsyncCloseable
 from ragnor.retrieval.capabilities import BackendFeature, StoreCapabilities
 from ragnor.retrieval.retriever import HybridRetriever, RetrieverSpec
 from ragnor.retrieval.strategies import HybridRetrieval, RetrievalStrategy
@@ -296,6 +298,7 @@ class RagnorBuilder:
         self._retrieval_strategy = retrieval_strategy
         self._event_sink = event_sink
         self._production_mode = production_mode
+        self._owned_resources: list[AsyncCloseable] = []
 
     @classmethod
     def local(  # noqa: PLR0913
@@ -422,6 +425,19 @@ class RagnorBuilder:
         self._event_sink = event_sink
         return self
 
+    def with_owned_resource(self, resource: AsyncCloseable) -> RagnorBuilder:
+        """Transfer ownership of an async-closeable resource to the Ragnor facade.
+
+        Unlike injected stores, embedders and sessions, resources registered
+        here are closed by `aclose()` in reverse registration order. A resource
+        is registered once by identity even if passed repeatedly.
+        """
+        if not callable(getattr(resource, "aclose", None)):
+            raise TypeError("owned resource must implement async aclose()")
+        if all(existing is not resource for existing in self._owned_resources):
+            self._owned_resources.append(resource)
+        return self
+
     def with_production_mode(self) -> RagnorBuilder:
         """Refuse known ephemeral defaults when building a persistent application.
 
@@ -541,12 +557,17 @@ class RagnorBuilder:
             strategy=strategy,
             event_sink=self._event_sink,
         )
+        # Transfer ownership exactly once: a reusable builder must never
+        # accidentally register the same closeable in two SDK clients.
+        owned_resources = tuple(self._owned_resources)
+        self._owned_resources.clear()
         return Ragnor(
             store=store,
             pipeline=pipeline,
             retriever=retriever,
             version_store=version_store,
             settings=settings,
+            owned_resources=owned_resources,
         )
 
 
@@ -565,6 +586,8 @@ class Ragnor:
         retriever: HybridRetriever,
         version_store: VersionStore,
         settings: RagSettings,
+        *,
+        owned_resources: tuple[AsyncCloseable, ...] = (),
     ) -> None:
         """Initialize the facade.
 
@@ -575,12 +598,85 @@ class Ragnor:
             version_store: Version storage the pipeline records
                 snapshots in.
             settings: Settings the pipeline and retriever read.
+            owned_resources: Explicitly transferred resources to close when
+                the client exits or calls aclose(); injected resources are
+                borrowed by default.
         """
         self.store = store
         self.pipeline = pipeline
         self.retriever = retriever
         self._version_store = version_store
         self._settings = settings
+        self._owned_resources = owned_resources
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._active_ops = 0
+        self._operations_drained = asyncio.Event()
+        self._operations_drained.set()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Ragnor client is closed")
+
+    @asynccontextmanager
+    async def _active_operation(self) -> AsyncIterator[None]:
+        """Hold a facade-level operation lease until the call completes."""
+        self._ensure_open()
+        self._active_ops += 1
+        self._operations_drained.clear()
+        try:
+            yield
+        finally:
+            self._active_ops -= 1
+            if self._active_ops == 0:
+                self._operations_drained.set()
+
+    async def __aenter__(self) -> Ragnor:
+        """Enter an async context managed facade."""
+        self._ensure_open()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """Close explicitly owned resources, leaving borrowed clients open."""
+        await self.aclose()
+
+    async def _close_owned_resources(self) -> None:
+        errors: list[Exception] = []
+        for resource in reversed(self._owned_resources):
+            try:
+                await resource.aclose()
+            except Exception as error:
+                errors.append(error)
+        if len(errors) > 1:
+            raise ExceptionGroup("Ragnor resource cleanup failed", errors)
+        if errors:
+            raise errors[0]
+
+    async def _drain_and_close(self) -> None:
+        await self._operations_drained.wait()
+        await self._close_owned_resources()
+
+    async def aclose(self) -> None:
+        """Close explicitly owned resources exactly once.
+
+        All callers await the same cleanup task. Cancelling a caller does not
+        abandon disposal of remaining SDK-owned resources.
+        """
+        # Repeated close is idempotent even if the first cleanup surfaced
+        # an error. Do not re-raise a completed task's prior exception.
+        if self._close_task is not None and self._close_task.done():
+            return
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._drain_and_close())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            # Complete owned-resource cleanup before surfacing caller
+            # cancellation. The shield prevents cancellation propagation
+            # into the owned cleanup task.
+            await asyncio.shield(self._close_task)
+            raise
 
     async def ingest(
         self,
@@ -611,13 +707,14 @@ class Ragnor:
             The number of chunks stored, or the stored chunk count
             when the documents were unchanged.
         """
-        source = ListDocumentSource(documents)
-        return await self.pipeline.run(
-            source,
-            self._version_store,
-            purge_on_empty=purge_on_empty,
-            lock_key=lock_key,
-        )
+        async with self._active_operation():
+            source = ListDocumentSource(documents)
+            return await self.pipeline.run(
+                source,
+                self._version_store,
+                purge_on_empty=purge_on_empty,
+                lock_key=lock_key,
+            )
 
     async def search(
         self,
@@ -636,7 +733,8 @@ class Ragnor:
         Returns:
             Search results sorted by RRF score.
         """
-        return await self.retriever.retrieve(query, n_results=n_results, **filters)
+        async with self._active_operation():
+            return await self.retriever.retrieve(query, n_results=n_results, **filters)
 
     async def count(self, **filters: Any) -> int:
         """Count documents in the store.
@@ -648,4 +746,5 @@ class Ragnor:
         Returns:
             Number of matching documents.
         """
-        return await self.store.count(**filters)
+        async with self._active_operation():
+            return await self.store.count(**filters)
